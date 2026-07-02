@@ -34,6 +34,10 @@ switch (process.platform) {
     pluginName = process.arch == "x64" ? "x64/pepflashplayer.dll" : "x32/pepflashplayer32.dll";
     osName = "windows";
     break;
+  case "linux":
+    pluginName = "linux/libpepflashplayer.so";
+    osName = "linux";
+    break;
   default:
     pluginName = "x64/pepflashplayer.dll";
     break;
