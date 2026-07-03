@@ -6,7 +6,7 @@ const fs = require("fs");
 const os = require("os");
 const logger = require("./logger");
 const googleAuth = require("./googleAuth");
-const vault = require("./vault");
+const prefs = require("./prefs");
 
 const LOGIN_URL = "https://play.ekoloko.org/ekoloko/login.html";
 const DISCORD_URL = "https://discord.gg/5uBSQx4yWa";
@@ -28,7 +28,6 @@ let win;
 let siteView;
 let signInView = null;
 let pendingGoogleProfile = null;
-let pendingGuestName = null;
 let loginSniffAttached = false;
 let pluginName;
 let osName;
@@ -588,11 +587,10 @@ function getSignInPageHtml() {
           <div class="status" id="status"></div>
           <div id="step2">
             <div class="who"><img id="gPic" src="" alt="" /><span id="gName"></span></div>
-            <div class="sub">כמעט סיימנו! מחברים את חשבון אקולוקו שלך — פעם אחת בלבד:</div>
-            <input type="text" id="gameUser" placeholder="שם משתמש במשחק" autocomplete="off" />
-            <input type="password" id="gamePass" placeholder="סיסמה" />
-            <button class="btn" id="linkBtn" type="button">חיבור וכניסה למשחק</button>
-            <div class="link-note">הפרטים נשמרים מוצפנים על המחשב הזה בלבד, ולא נשלחים לשום מקום חוץ משרת המשחק.</div>
+            <div class="sub">כמעט שם! מקלידים את שם המשתמש שלכם במשחק (אם יש), נכנסים פעם אחת — והמשחק יזכור אתכם בכניסות הבאות:</div>
+            <input type="text" id="gameUser" placeholder="שם משתמש במשחק (לא חובה)" autocomplete="off" />
+            <button class="btn" id="continueBtn" type="button">המשך למשחק</button>
+            <div class="link-note">לא שומרים סיסמאות באפליקציה — הכניסה מתבצעת ישירות במשחק, והמשחק זוכר אתכם.</div>
           </div>
           <div class="guest">
             <div class="guest-name-row">
@@ -600,7 +598,7 @@ function getSignInPageHtml() {
               <span class="guest-name" id="guestName"></span>
             </div>
             <button class="btn" id="guestBtn" type="button">🎮 משחק כאורח</button>
-            <div class="link-note">לאורח מוגרל שם אקראי, בלי שמירה בין כניסות. כדי לשמור את ההתקדמות — מתחברים עם Google.</div>
+            <div class="link-note">בפעם הראשונה יוצרים חשבון אורח מהיר עם השם המוגרל — ומהכניסה הבאה נכנסים בלחיצה אחת.</div>
           </div>
           <div class="alt">אין לך חשבון? <a id="registerLink">להרשמה</a> &middot; <a id="skipLink">כניסה רגילה בלי Google</a></div>
         </div>
@@ -629,18 +627,9 @@ function getSignInPageHtml() {
             step2.style.display = "flex";
           });
 
-          document.getElementById("linkBtn").addEventListener("click", () => {
+          document.getElementById("continueBtn").addEventListener("click", () => {
             const username = document.getElementById("gameUser").value.trim();
-            const password = document.getElementById("gamePass").value;
-            if (!username || !password) {
-              status.textContent = "צריך למלא שם משתמש וסיסמה";
-              return;
-            }
-            ipcRenderer.send("link-account", { username, password });
-          });
-
-          ipcRenderer.on("link-account-result", (_event, result) => {
-            if (!result.ok) status.textContent = result.error || "משהו השתבש";
+            ipcRenderer.send("google-continue", { username });
           });
 
           document.getElementById("registerLink").addEventListener("click", () => ipcRenderer.send("open-register"));
@@ -877,16 +866,23 @@ function createWindow() {
   showApp();
 }
 
-// Entry decision on startup: a linked account goes straight into the game
-// with the auto-login params; otherwise the sign-in-with-Google screen.
+// Entry decision on startup. If the player has already chosen a mode before
+// (guest / google / plain), go straight into the game and let the Flash
+// client's own "remember me" relogin them; otherwise show the sign-in screen.
 function showApp() {
-  const stored = vault.load();
-  if (stored && stored.game && stored.game.username) {
-    logger.info("auth", `auto-login as linked account "${stored.game.username}"`);
-    createGameView(buildAutoLoginUrl(stored.game.username));
+  const p = prefs.load();
+  if (p && p.mode) {
+    logger.info("auth", `resuming mode=${p.mode}${p.username ? ` user="${p.username}"` : ""}`);
+    createGameView(entryUrlForResume(p));
   } else {
     createSignInView();
   }
+}
+
+// Load the game's login page so its own relogin token signs the player back
+// in; prefill the username when we know it (purely cosmetic if relogin fires).
+function entryUrlForResume(p) {
+  return p.username ? buildAutoLoginUrl(p.username) : LOGIN_URL;
 }
 
 function createGameView(url) {
@@ -998,6 +994,21 @@ function destroySignInView() {
   win.setBrowserView(null);
   signInView.destroy();
   signInView = null;
+}
+
+// "Switch account" must forget who the game remembers. The Flash client stores
+// its relogin token as a Local Shared Object under the PPAPI Flash data tree in
+// userData; deleting that tree forces the next launch back to a clean login.
+// (The game's own storage the "clear cache" button wipes — localStorage etc. —
+// does NOT include these Flash LSOs, so this is a separate, deliberate step.)
+function clearFlashRememberMe() {
+  const flashRoot = path.join(app.getPath("userData"), "Pepper Data", "Shockwave Flash");
+  try {
+    fs.rmSync(flashRoot, { recursive: true, force: true });
+    logger.info("auth", `cleared Flash stored data at ${flashRoot}`);
+  } catch (e) {
+    logger.warn("auth", `could not clear Flash stored data: ${(e && e.message) || e}`);
+  }
 }
 
 // DEBUG-only: mirror the game's POST traffic into the log (passwords masked)
@@ -1205,56 +1216,61 @@ app.whenReady().then(() => {
     }
   });
 
-  ipcMain.on("link-account", (event, creds) => {
-    if (!creds || !creds.username || !creds.password) {
-      event.reply("link-account-result", { ok: false, error: "חסרים פרטים" });
-      return;
-    }
-    vault.save({
-      google: pendingGoogleProfile,
-      game: { username: creds.username, password: creds.password },
-      linkedAt: new Date().toISOString(),
+  // After Google identity, drop the player into the game's own login screen
+  // (username prefilled if they gave one) and let them log in once; the Flash
+  // client's "remember me" keeps them signed in on later launches. We store
+  // only a non-secret resume marker — never the password.
+  ipcMain.on("google-continue", (_event, data) => {
+    const username = data && data.username ? String(data.username).trim() : "";
+    prefs.save({
+      mode: "google",
+      username: username || undefined,
+      googleEmail: pendingGoogleProfile ? pendingGoogleProfile.email : undefined,
     });
-    logger.info("auth", `linked game account "${creds.username}"`);
-    createGameView(buildAutoLoginUrl(creds.username));
+    logger.info("auth", `google continue (user="${username || "-"}")`);
+    createGameView(username ? buildAutoLoginUrl(username) : LOGIN_URL);
   });
 
   ipcMain.on("sign-out", () => {
-    vault.clear();
+    prefs.clear();
     pendingGoogleProfile = null;
-    logger.info("auth", "signed out; vault cleared");
+    // A real "switch account" must also drop the Flash client's remembered
+    // login, otherwise it would just relogin the previous player.
+    clearFlashRememberMe();
+    logger.info("auth", "signed out; prefs + flash remember-me cleared");
     createSignInView();
   });
 
   ipcMain.on("open-register", () => {
+    prefs.save({ mode: "plain" });
     createGameView(`${LOGIN_URL}?register=1`);
   });
 
   ipcMain.on("open-game-plain", () => {
+    prefs.save({ mode: "plain" });
     createGameView(LOGIN_URL);
   });
 
   ipcMain.on("play-as-guest", (_event, guestName) => {
-    // "Auto-create, reuse per device": one throwaway account per machine,
-    // remembered in the vault. If we already have it, log straight in;
-    // otherwise create it once via the game's real registration screen
-    // (register=1, name prefilled). The server deliberately blocks headless
-    // registration (register.php gates on an anti-bot "authentication" check),
-    // so the one-time creation must go through the genuine flow — after that,
-    // every launch is one click. See vault.load()/auto-login in showApp().
-    const stored = vault.load();
-    if (stored && stored.guest && stored.game && stored.game.username) {
-      logger.info("auth", `guest auto-login as "${stored.game.username}"`);
-      createGameView(buildAutoLoginUrl(stored.game.username));
+    // "Auto-create, reuse per device": one throwaway account per machine.
+    // A returning guest goes straight into the game and the Flash client's
+    // "remember me" logs them back in. A first-time guest creates the account
+    // once via the game's real registration screen (register=1, name
+    // prefilled) — the server deliberately blocks headless registration
+    // (register.php gates on an anti-bot "authentication" check), so the
+    // one-time creation must go through the genuine flow. After that, every
+    // launch is one click.
+    const p = prefs.load();
+    if (p && p.mode === "guest" && p.username) {
+      logger.info("auth", `returning guest "${p.username}"`);
+      createGameView(buildAutoLoginUrl(p.username));
       return;
     }
     const name = /^[A-Za-z0-9]{3,20}$/.test(String(guestName || ""))
       ? guestName
       : `EcoGuest${100 + Math.floor(Math.random() * 900)}`;
-    // Remember the intended guest name so the post-registration capture can
-    // pair it with whatever password the player sets and store the pair.
-    pendingGuestName = name;
-    logger.info("auth", `creating guest account "${name}" via registration`);
+    prefs.save({ mode: "guest", username: name });
+    logger.info("auth", `new guest "${name}" -> registration`);
     createGameView(`${LOGIN_URL}?register=1&username=${encodeURIComponent(name)}`);
   });
 
