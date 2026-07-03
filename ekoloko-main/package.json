@@ -42,7 +42,8 @@
       }
     ],
     "extraResources": [
-      "./assets/**"
+      "./assets/**",
+      "./google-oauth.json"
     ],
     "win": {
       "target": [

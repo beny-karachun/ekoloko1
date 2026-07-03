@@ -5,6 +5,8 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 const logger = require("./logger");
+const googleAuth = require("./googleAuth");
+const vault = require("./vault");
 
 const LOGIN_URL = "https://play.ekoloko.org/ekoloko/login.html";
 const DISCORD_URL = "https://discord.gg/5uBSQx4yWa";
@@ -24,6 +26,10 @@ const DEBUG_MODE =
 
 let win;
 let siteView;
+let signInView = null;
+let pendingGoogleProfile = null;
+let pendingGuestName = null;
+let loginSniffAttached = false;
 let pluginName;
 let osName;
 let isDarkMode = false;
@@ -115,6 +121,27 @@ function getAssetFontUrl(filename) {
   } catch (e) {
     return "";
   }
+}
+
+// google-oauth.json holds the Google OAuth "Desktop app" client id/secret for
+// the sign-in-with-Google flow (see googleAuth.js). Placeholder "YOUR_*"
+// values are treated as unconfigured, so the checked-in template never breaks
+// a build — the sign-in screen shows setup instructions instead.
+function getOAuthConfig() {
+  const candidates = [
+    path.join(process.resourcesPath || "", "google-oauth.json"),
+    path.join(__dirname, "..", "..", "google-oauth.json"),
+    path.join(__dirname, "..", "..", "..", "google-oauth.json"),
+  ];
+  for (const p of candidates) {
+    try {
+      const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
+      if (cfg.clientId && cfg.clientSecret && cfg.clientId.indexOf("YOUR_") !== 0) {
+        return cfg;
+      }
+    } catch (e) {}
+  }
+  return null;
 }
 
 function getControlPageHtml() {
@@ -317,6 +344,10 @@ function getControlPageHtml() {
 
           <button class="btn" id="darkModeBtn" type="button">🌙 מצב לילה</button>
 
+          <div class="spacer"></div>
+
+          <button class="btn" id="switchUserBtn" type="button">🔑 החלף חשבון</button>
+
           ${discordSrc
             ? `<button class="btn-icon" id="openDiscord" type="button" title="דיסקורד"><img src="${discordSrc}" alt="דיסקורד" /></button>`
             : `<button class="btn" id="openDiscord" type="button">דיסקורד</button>`
@@ -396,6 +427,10 @@ function getControlPageHtml() {
             ipcRenderer.send("open-discord");
           });
 
+          document.getElementById("switchUserBtn").addEventListener("click", () => {
+            ipcRenderer.send("sign-out");
+          });
+
           zoomValue.textContent = formatPercent(zoom.value);
           setSliderFill(zoom);
         </script>
@@ -404,20 +439,248 @@ function getControlPageHtml() {
   `;
 }
 
+// The login page forwards `username` and `directLogin` into shell.swf as URL
+// params (login.html builds swfUrl from them), so this is the only automation
+// hook we have without server access. What directLogin does exactly lives
+// inside the SWF — if it turns out not to complete the login, the user types
+// the password once and the --devtools login sniffer (attachLoginSniffer)
+// records the real login request so we can replay it properly later.
+function buildAutoLoginUrl(username) {
+  return `${LOGIN_URL}?username=${encodeURIComponent(username)}&directLogin=true`;
+}
+
+function getSignInPageHtml() {
+  const logoSrc = getAssetDataUrl("3.png");
+  const fontSrc = getAssetFontUrl("Gan CLM Bold.ttf");
+  const hasOAuthConfig = !!getOAuthConfig();
+  return `
+    <!doctype html>
+    <html dir="rtl" lang="he">
+      <head>
+        <meta charset="UTF-8" />
+        <title>ekoloko - כניסה</title>
+        <style>
+          ${fontSrc ? `@font-face { font-family: 'GanCLM'; src: url('${fontSrc}') format('truetype'); font-weight: bold; }` : ""}
+          * { box-sizing: border-box; margin: 0; padding: 0; }
+          body {
+            font-family: 'GanCLM', 'Arial Rounded MT Bold', Arial, sans-serif;
+            min-height: 100vh;
+            background: linear-gradient(180deg, #8fd42e 0%, #6aaa1e 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+            gap: 24px;
+            padding: 24px;
+          }
+          .logo { height: 120px; }
+          .card {
+            background: #3a6fd8;
+            border: 3px solid #2a55c0;
+            border-radius: 18px;
+            padding: 28px 32px;
+            width: 100%;
+            max-width: 440px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            color: #fff;
+            text-align: center;
+          }
+          h1 { font-size: 24px; }
+          .sub { font-size: 15px; color: #b8cdff; line-height: 1.5; }
+          .setup {
+            background: #fff3c4;
+            color: #6b5200;
+            border-radius: 10px;
+            padding: 10px 14px;
+            font-size: 13px;
+            line-height: 1.5;
+            text-align: right;
+          }
+          .gbtn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            background: #fff;
+            color: #333;
+            border: none;
+            border-radius: 12px;
+            border-bottom: 4px solid #c9c9c9;
+            height: 52px;
+            font-family: inherit;
+            font-size: 17px;
+            cursor: pointer;
+            transition: transform 0.1s, filter 0.1s;
+          }
+          .gbtn:hover:not(:disabled) { filter: brightness(0.96); }
+          .gbtn:active:not(:disabled) { transform: translateY(3px); border-bottom-width: 1px; }
+          .gbtn:disabled { opacity: 0.55; cursor: default; }
+          .status { font-size: 14px; min-height: 20px; color: #ffe08a; }
+          #step2 { display: none; flex-direction: column; gap: 12px; }
+          .who { display: flex; align-items: center; justify-content: center; gap: 10px; font-size: 16px; }
+          .who img { width: 36px; height: 36px; border-radius: 50%; }
+          input[type="text"], input[type="password"] {
+            height: 46px;
+            border-radius: 10px;
+            border: none;
+            padding: 0 14px;
+            font-family: inherit;
+            font-size: 16px;
+            text-align: center;
+          }
+          .link-note { font-size: 12.5px; color: #b8cdff; line-height: 1.5; }
+          .btn {
+            border: none;
+            border-radius: 12px;
+            height: 50px;
+            background: linear-gradient(180deg, #ff9a2a 0%, #fb7d07 100%);
+            border-bottom: 4px solid #c05800;
+            color: #fff;
+            font-family: inherit;
+            font-size: 17px;
+            cursor: pointer;
+            text-shadow: 1px 1px 2px rgba(0,0,0,0.3);
+            transition: transform 0.1s, border-bottom-width 0.1s;
+          }
+          .btn:active { transform: translateY(3px); border-bottom-width: 1px; }
+          .alt { font-size: 13.5px; color: #dce8ff; }
+          .alt a { color: #ffd36a; cursor: pointer; text-decoration: underline; }
+          .guest {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            border-top: 2px solid rgba(255,255,255,0.25);
+            padding-top: 14px;
+          }
+          .guest-name-row { display: flex; align-items: center; justify-content: center; gap: 10px; }
+          .guest-name {
+            background: rgba(255,255,255,0.15);
+            border-radius: 10px;
+            padding: 8px 16px;
+            font-size: 17px;
+            letter-spacing: 0.03em;
+            min-width: 180px;
+            direction: ltr;
+          }
+          .dice {
+            background: none;
+            border: none;
+            font-size: 26px;
+            cursor: pointer;
+            transition: transform 0.15s;
+          }
+          .dice:hover { transform: rotate(20deg) scale(1.15); }
+          .dice:active { transform: rotate(180deg) scale(0.9); }
+        </style>
+      </head>
+      <body>
+        ${logoSrc ? `<img class="logo" src="${logoSrc}" alt="ekoloko" />` : ""}
+        <div class="card">
+          <h1>ברוכים הבאים לאקולוקו!</h1>
+          <div class="sub">מתחברים פעם אחת עם Google — ומכאן והלאה נכנסים למשחק בלחיצה אחת.</div>
+          ${hasOAuthConfig ? "" : `<div class="setup">התחברות עם Google עוד לא הופעלה בהתקנה הזו: חסר הקובץ google-oauth.json (מזהה לקוח OAuth מסוג Desktop מ-Google Cloud Console). בינתיים אפשר להיכנס למשחק כרגיל למטה.</div>`}
+          <button class="gbtn" id="googleBtn" type="button" ${hasOAuthConfig ? "" : "disabled"}>
+            <svg width="20" height="20" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+            התחברות עם Google
+          </button>
+          <div class="status" id="status"></div>
+          <div id="step2">
+            <div class="who"><img id="gPic" src="" alt="" /><span id="gName"></span></div>
+            <div class="sub">כמעט סיימנו! מחברים את חשבון אקולוקו שלך — פעם אחת בלבד:</div>
+            <input type="text" id="gameUser" placeholder="שם משתמש במשחק" autocomplete="off" />
+            <input type="password" id="gamePass" placeholder="סיסמה" />
+            <button class="btn" id="linkBtn" type="button">חיבור וכניסה למשחק</button>
+            <div class="link-note">הפרטים נשמרים מוצפנים על המחשב הזה בלבד, ולא נשלחים לשום מקום חוץ משרת המשחק.</div>
+          </div>
+          <div class="guest">
+            <div class="guest-name-row">
+              <button class="dice" id="rerollBtn" type="button" title="הגרילו שם אחר">🎲</button>
+              <span class="guest-name" id="guestName"></span>
+            </div>
+            <button class="btn" id="guestBtn" type="button">🎮 משחק כאורח</button>
+            <div class="link-note">לאורח מוגרל שם אקראי, בלי שמירה בין כניסות. כדי לשמור את ההתקדמות — מתחברים עם Google.</div>
+          </div>
+          <div class="alt">אין לך חשבון? <a id="registerLink">להרשמה</a> &middot; <a id="skipLink">כניסה רגילה בלי Google</a></div>
+        </div>
+        <script>
+          const { ipcRenderer } = require("electron");
+          const googleBtn = document.getElementById("googleBtn");
+          const status = document.getElementById("status");
+          const step2 = document.getElementById("step2");
+
+          googleBtn.addEventListener("click", () => {
+            googleBtn.disabled = true;
+            status.textContent = "פותחים את הדפדפן... אשרו שם את ההתחברות";
+            ipcRenderer.send("google-signin");
+          });
+
+          ipcRenderer.on("google-signin-result", (_event, result) => {
+            googleBtn.disabled = false;
+            if (!result.ok) {
+              status.textContent = "ההתחברות לא הושלמה, אפשר לנסות שוב";
+              return;
+            }
+            status.textContent = "";
+            googleBtn.style.display = "none";
+            document.getElementById("gName").textContent = result.profile.name || result.profile.email;
+            if (result.profile.picture) document.getElementById("gPic").src = result.profile.picture;
+            step2.style.display = "flex";
+          });
+
+          document.getElementById("linkBtn").addEventListener("click", () => {
+            const username = document.getElementById("gameUser").value.trim();
+            const password = document.getElementById("gamePass").value;
+            if (!username || !password) {
+              status.textContent = "צריך למלא שם משתמש וסיסמה";
+              return;
+            }
+            ipcRenderer.send("link-account", { username, password });
+          });
+
+          ipcRenderer.on("link-account-result", (_event, result) => {
+            if (!result.ok) status.textContent = result.error || "משהו השתבש";
+          });
+
+          document.getElementById("registerLink").addEventListener("click", () => ipcRenderer.send("open-register"));
+          document.getElementById("skipLink").addEventListener("click", () => ipcRenderer.send("open-game-plain"));
+
+          const GUEST_ADJECTIVES = ["Green", "Eco", "Sunny", "Wild", "Happy", "Swift", "Leafy", "Brave", "Magic", "Cosmic", "Funky", "Turbo"];
+          const GUEST_ANIMALS = ["Frog", "Turtle", "Panda", "Fox", "Owl", "Koala", "Dolphin", "Bee", "Tiger", "Whale", "Gecko", "Otter"];
+          const guestNameEl = document.getElementById("guestName");
+
+          function pick(list) { return list[Math.floor(Math.random() * list.length)]; }
+          function rerollGuestName() {
+            guestNameEl.textContent = pick(GUEST_ADJECTIVES) + pick(GUEST_ANIMALS) + (100 + Math.floor(Math.random() * 900));
+          }
+
+          document.getElementById("rerollBtn").addEventListener("click", rerollGuestName);
+          document.getElementById("guestBtn").addEventListener("click", () => {
+            ipcRenderer.send("play-as-guest", guestNameEl.textContent);
+          });
+          rerollGuestName();
+        </script>
+      </body>
+    </html>
+  `;
+}
+
 function setViewBounds() {
-  if (!win || !siteView) {
+  const view = siteView || signInView;
+  if (!win || !view) {
     return;
   }
 
   const bounds = win.getContentBounds();
-  siteView.setBounds({
+  view.setBounds({
     x: 0,
     y: CONTROL_BAR_HEIGHT,
     width: bounds.width,
     height: Math.max(0, bounds.height - CONTROL_BAR_HEIGHT),
   });
 
-  siteView.setAutoResize({ width: true, height: true });
+  view.setAutoResize({ width: true, height: true });
 }
 
 async function applyZoom(zoomFactor) {
@@ -561,13 +824,17 @@ function attachWebContentsLogging(wc, source) {
 }
 
 // When launched with --devtools, F12 / Ctrl+Shift+I toggle the game's DevTools.
-function attachDevtoolsShortcut(wc, targetWc) {
+// getTarget is a function because the game view is created/destroyed across
+// sign-in/sign-out, while the shortcut stays attached to the window.
+function attachDevtoolsShortcut(wc, getTarget) {
   wc.on("before-input-event", (event, input) => {
     if (input.type !== "keyDown") return;
     const isF12 = input.key === "F12";
     const isCtrlShiftI =
       input.control && input.shift && String(input.key).toLowerCase() === "i";
     if (isF12 || isCtrlShiftI) {
+      const targetWc = getTarget();
+      if (!targetWc) return;
       if (targetWc.isDevToolsOpened()) targetWc.closeDevTools();
       else targetWc.openDevTools({ mode: "detach" });
       event.preventDefault();
@@ -593,6 +860,45 @@ function createWindow() {
   fs.writeFileSync(controlHtmlPath, getControlPageHtml(), "utf8");
   win.loadFile(controlHtmlPath);
 
+  attachWebContentsLogging(win.webContents, "control-bar");
+
+  if (DEBUG_MODE) {
+    logger.info("devtools", "launched with --devtools; DevTools enabled");
+    attachDevtoolsShortcut(win.webContents, () => siteView && siteView.webContents);
+  }
+
+  win.on("resize", setViewBounds);
+  win.on("closed", () => {
+    win = null;
+    siteView = null;
+    signInView = null;
+  });
+
+  showApp();
+}
+
+// Entry decision on startup: a linked account goes straight into the game
+// with the auto-login params; otherwise the sign-in-with-Google screen.
+function showApp() {
+  const stored = vault.load();
+  if (stored && stored.game && stored.game.username) {
+    logger.info("auth", `auto-login as linked account "${stored.game.username}"`);
+    createGameView(buildAutoLoginUrl(stored.game.username));
+  } else {
+    createSignInView();
+  }
+}
+
+function createGameView(url) {
+  destroySignInView();
+
+  if (siteView) {
+    win.setBrowserView(siteView);
+    setViewBounds();
+    siteView.webContents.loadURL(url);
+    return;
+  }
+
   siteView = new BrowserView({
     webPreferences: {
       nodeIntegration: false,
@@ -617,23 +923,21 @@ function createWindow() {
   setViewBounds();
 
   attachWebContentsLogging(siteView.webContents, "game");
-  attachWebContentsLogging(win.webContents, "control-bar");
 
   if (DEBUG_MODE) {
-    logger.info("devtools", "launched with --devtools; DevTools enabled");
-    attachDevtoolsShortcut(siteView.webContents, siteView.webContents);
-    attachDevtoolsShortcut(win.webContents, siteView.webContents);
+    attachDevtoolsShortcut(siteView.webContents, () => siteView && siteView.webContents);
     siteView.webContents.once("dom-ready", () => {
       siteView.webContents.openDevTools({ mode: "detach" });
     });
+    attachLoginSniffer();
   }
 
-  siteView.webContents.loadURL(LOGIN_URL);
+  siteView.webContents.loadURL(url);
   siteView.webContents.setAudioMuted(false);
 
-  siteView.webContents.on("new-window", (event, url) => {
+  siteView.webContents.on("new-window", (event, popupUrl) => {
     event.preventDefault();
-    if (url === DISCORD_URL) {
+    if (popupUrl === DISCORD_URL) {
       openDiscordLink();
       return;
     }
@@ -648,18 +952,79 @@ function createWindow() {
         allowRunningInsecureContent: true,
       },
     });
-    popup.loadURL(url);
+    popup.loadURL(popupUrl);
   });
 
   siteView.webContents.on("did-finish-load", () => {
     if (isDarkMode) applyDarkModeCSS(true);
   });
+}
 
-  win.on("resize", setViewBounds);
-  win.on("closed", () => {
-    win = null;
-    siteView = null;
+function destroyGameView() {
+  if (!siteView) return;
+  win.setBrowserView(null);
+  siteView.destroy();
+  siteView = null;
+  darkModeCSSKey = null;
+}
+
+function createSignInView() {
+  if (signInView) return;
+  destroyGameView();
+
+  signInView = new BrowserView({
+    webPreferences: {
+      // Local app-generated page (same trust level as the control bar); it
+      // needs ipcRenderer for the sign-in choreography. Never load remote
+      // content in this view.
+      nodeIntegration: true,
+      contextIsolation: false,
+      devTools: DEBUG_MODE,
+    },
   });
+
+  win.setBrowserView(signInView);
+  signInView.setBackgroundColor("#6aaa1e");
+  setViewBounds();
+  attachWebContentsLogging(signInView.webContents, "signin");
+
+  const signInHtmlPath = path.join(app.getPath("temp"), `ekoloko-signin-${Date.now()}.html`);
+  fs.writeFileSync(signInHtmlPath, getSignInPageHtml(), "utf8");
+  signInView.webContents.loadFile(signInHtmlPath);
+}
+
+function destroySignInView() {
+  if (!signInView) return;
+  win.setBrowserView(null);
+  signInView.destroy();
+  signInView = null;
+}
+
+// DEBUG-only: mirror the game's POST traffic into the log (passwords masked)
+// so we can discover the actual login request. Once known, auto-login can
+// replay it directly instead of relying on the page's directLogin flag.
+function attachLoginSniffer() {
+  if (loginSniffAttached || !siteView) return;
+  loginSniffAttached = true;
+  siteView.webContents.session.webRequest.onBeforeRequest(
+    { urls: ["*://play.ekoloko.org/*"] },
+    (details, callback) => {
+      if (details.method === "POST") {
+        let body = "";
+        try {
+          if (details.uploadData && details.uploadData[0] && details.uploadData[0].bytes) {
+            body = details.uploadData[0].bytes.toString("utf8").slice(0, 300);
+          }
+        } catch (e) {}
+        const masked = `${details.url}${body ? ` body=${body}` : ""}`.replace(
+          /(pass(word)?["']?[=:]["']?)[^&\s"']*/gi,
+          "$1***"
+        );
+        logger.info("net", `POST ${masked}`);
+      }
+      callback({});
+    }
+  );
 }
 
 function getUninstallerPath() {
@@ -818,6 +1183,79 @@ app.whenReady().then(() => {
 
   ipcMain.on("open-discord", () => {
     openDiscordLink();
+  });
+
+  ipcMain.on("google-signin", async (event) => {
+    const config = getOAuthConfig();
+    if (!config) {
+      event.reply("google-signin-result", { ok: false, error: "missing google-oauth.json" });
+      return;
+    }
+    try {
+      const profile = await googleAuth.signIn(config);
+      pendingGoogleProfile = profile;
+      logger.info("auth", `google sign-in ok (${profile.email || profile.sub})`);
+      event.reply("google-signin-result", {
+        ok: true,
+        profile: { name: profile.name, email: profile.email, picture: profile.picture },
+      });
+    } catch (e) {
+      logger.error("auth", `google sign-in failed: ${(e && e.message) || e}`);
+      event.reply("google-signin-result", { ok: false, error: (e && e.message) || String(e) });
+    }
+  });
+
+  ipcMain.on("link-account", (event, creds) => {
+    if (!creds || !creds.username || !creds.password) {
+      event.reply("link-account-result", { ok: false, error: "חסרים פרטים" });
+      return;
+    }
+    vault.save({
+      google: pendingGoogleProfile,
+      game: { username: creds.username, password: creds.password },
+      linkedAt: new Date().toISOString(),
+    });
+    logger.info("auth", `linked game account "${creds.username}"`);
+    createGameView(buildAutoLoginUrl(creds.username));
+  });
+
+  ipcMain.on("sign-out", () => {
+    vault.clear();
+    pendingGoogleProfile = null;
+    logger.info("auth", "signed out; vault cleared");
+    createSignInView();
+  });
+
+  ipcMain.on("open-register", () => {
+    createGameView(`${LOGIN_URL}?register=1`);
+  });
+
+  ipcMain.on("open-game-plain", () => {
+    createGameView(LOGIN_URL);
+  });
+
+  ipcMain.on("play-as-guest", (_event, guestName) => {
+    // "Auto-create, reuse per device": one throwaway account per machine,
+    // remembered in the vault. If we already have it, log straight in;
+    // otherwise create it once via the game's real registration screen
+    // (register=1, name prefilled). The server deliberately blocks headless
+    // registration (register.php gates on an anti-bot "authentication" check),
+    // so the one-time creation must go through the genuine flow — after that,
+    // every launch is one click. See vault.load()/auto-login in showApp().
+    const stored = vault.load();
+    if (stored && stored.guest && stored.game && stored.game.username) {
+      logger.info("auth", `guest auto-login as "${stored.game.username}"`);
+      createGameView(buildAutoLoginUrl(stored.game.username));
+      return;
+    }
+    const name = /^[A-Za-z0-9]{3,20}$/.test(String(guestName || ""))
+      ? guestName
+      : `EcoGuest${100 + Math.floor(Math.random() * 900)}`;
+    // Remember the intended guest name so the post-registration capture can
+    // pair it with whatever password the player sets and store the pair.
+    pendingGuestName = name;
+    logger.info("auth", `creating guest account "${name}" via registration`);
+    createGameView(`${LOGIN_URL}?register=1&username=${encodeURIComponent(name)}`);
   });
 
   ipcMain.on("clear-cache", async () => {
